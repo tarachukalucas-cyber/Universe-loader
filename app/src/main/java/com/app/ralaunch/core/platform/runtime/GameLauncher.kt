@@ -425,7 +425,7 @@ object GameLauncher {
             } else {
                 SdlVersion.displayName(SettingsAccess.runtimeSdlVersion)
             }
-            EnvVarsManager.quickSetEnvVars(mapOf("FNA_PLATFORM_BACKEND" to sdlBackend))
+            EnvVarsManager.quickSetEnvVar("FNA_PLATFORM_BACKEND", sdlBackend)
             AppLog.i(TAG, "FNA API backend: $sdlBackend; SDL runtime: ${SettingsAccess.runtimeSdlVersion}")
 
             val runtimeSpec = resolveRuntimeSpec(dotNetRuntimeVersionOverride)

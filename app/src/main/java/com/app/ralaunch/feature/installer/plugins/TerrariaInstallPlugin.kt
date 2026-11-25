@@ -5,6 +5,7 @@ import com.app.ralaunch.RaLaunchApp
 import com.app.ralaunch.core.common.util.FileUtils
 import com.app.ralaunch.core.logging.AppLog
 import com.app.ralaunch.feature.installer.*
+import android.os.Environment
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -221,6 +222,151 @@ class TerrariaInstallPlugin : BaseInstallPlugin() {
         }
     }
     
+    /**
+     * Installs converted Terraria PE resources beside an Android-compatible
+     * tModLoader release. The official Terraria APK is never modified.
+     *
+     * [convertedResources] is the private output directory produced by
+     * TerrariaPeConversion and must contain a Content/ directory.
+     */
+    fun installConvertedResources(
+        convertedResources: File,
+        modLoaderFile: File,
+        gameStorageRootFull: File,
+        callback: InstallCallback
+    ) {
+        isCancelled = false
+        installJob = CoroutineScope(Dispatchers.IO).launch {
+            val staging = File(gameStorageRootFull, ".bunny-mobile-stage")
+            try {
+                withContext(Dispatchers.Main) {
+                    callback.onProgress("Preparando instalação isolada do Terraria PE…", 0)
+                }
+                require(File(convertedResources, "Content").isDirectory) {
+                    "A conversão não contém a pasta Content."
+                }
+                require(modLoaderFile.isFile) { "Pacote tModLoader não encontrado." }
+                val requiredDotNetRuntime = readRequiredDotNetRuntimeVersion(modLoaderFile)
+                if (!gameStorageRootFull.exists()) {
+                    check(gameStorageRootFull.mkdirs()) { "Não foi possível criar a pasta do jogo." }
+                }
+                val finalGameDir = File(gameStorageRootFull, "game")
+                require(!finalGameDir.exists()) { "Já existe uma instalação Bunny neste diretório." }
+                staging.deleteRecursively()
+                val terrariaDir = File(staging, "Terraria")
+                val tModLoaderDir = File(staging, "tModLoader")
+                check(terrariaDir.mkdirs()) { "Não foi possível preparar a pasta Terraria." }
+                copyDirectory(File(convertedResources, "Content"), File(terrariaDir, "Content"))
+
+                if (isCancelled) {
+                    staging.deleteRecursively()
+                    withContext(Dispatchers.Main) { callback.onCancelled() }
+                    return@launch
+                }
+                withContext(Dispatchers.Main) {
+                    callback.onProgress("Instalando tModLoader Android…", 35)
+                }
+                tModLoaderDir.mkdirs()
+                installTModLoader(modLoaderFile, tModLoaderDir, callback)
+                check(File(tModLoaderDir, "tModLoader.dll").isFile) {
+                    "O pacote não contém tModLoader.dll na raiz instalada."
+                }
+
+                if (isCancelled) {
+                    staging.deleteRecursively()
+                    withContext(Dispatchers.Main) { callback.onCancelled() }
+                    return@launch
+                }
+                withContext(Dispatchers.Main) {
+                    callback.onProgress("Aplicando compatibilidade MonoMod…", 90)
+                }
+                check(installMonoMod(tModLoaderDir)) {
+                    "Não foi possível aplicar os componentes de compatibilidade Android."
+                }
+                val iconPath = extractIcon(tModLoaderDir, GameDefinition.TMODLOADER)
+
+                check(staging.renameTo(finalGameDir)) {
+                    "Não foi possível finalizar a instalação isolada."
+                }
+                val actualTModLoaderDir = File(finalGameDir, "tModLoader")
+                prepareTModLoaderDataDirectories(actualTModLoaderDir)
+                createGameInfo(
+                    gameStorageRootFull,
+                    actualTModLoaderDir,
+                    GameDefinition.TMODLOADER,
+                    iconPath,
+                    runtimeOverride = requiredDotNetRuntime
+                )
+                val item = createGameItem(
+                    GameDefinition.TMODLOADER,
+                    gameStorageRootFull,
+                    actualTModLoaderDir,
+                    iconPath,
+                    runtimeOverride = requiredDotNetRuntime
+                )
+                withContext(Dispatchers.Main) {
+                    callback.onProgress("Instalação Bunny preparada.", 100)
+                    callback.onComplete(item)
+                }
+            } catch (error: Exception) {
+                staging.deleteRecursively()
+                withContext(Dispatchers.Main) {
+                    callback.onError(error.message ?: "Falha ao instalar Terraria PE com tModLoader.")
+                }
+            }
+        }
+    }
+
+    /**
+     * Reads the framework requirement from the official tModLoader package.
+     * Never launch this game with an arbitrary globally selected .NET runtime.
+     */
+    private fun readRequiredDotNetRuntimeVersion(archive: File): String {
+        ZipFile(archive).use { zip ->
+            val entry = zip.getEntry("tModLoader.runtimeconfig.json")
+                ?: zip.entries().asSequence().firstOrNull {
+                    it.name.endsWith("/tModLoader.runtimeconfig.json")
+                }
+                ?: error("O pacote tModLoader não contém tModLoader.runtimeconfig.json.")
+            val config = zip.getInputStream(entry).bufferedReader().use {
+                org.json.JSONObject(it.readText())
+            }
+            val options = config.optJSONObject("runtimeOptions")
+                ?: error("O runtimeconfig do tModLoader está inválido.")
+            val framework = options.optJSONObject("framework")
+                ?: options.optJSONArray("frameworks")?.optJSONObject(0)
+                ?: error("O runtimeconfig não declara um framework .NET.")
+            val name = framework.optString("name")
+            val version = framework.optString("version")
+            require(name == "Microsoft.NETCore.App") {
+                "Framework .NET não suportado pelo Bunny: " + name
+            }
+            require(Regex("[0-9]+\\.[0-9]+\\.[0-9]+").matches(version)) {
+                "Versão do runtime .NET inválida no pacote tModLoader: " + version
+            }
+            return version
+        }
+    }
+
+    /**
+     * Pre-creates tModLoader's expected user-data folders. GameLauncher uses
+     * the shared RALauncher data root when available and falls back to the
+     * assembly directory when Android storage access is restricted.
+     */
+    private fun prepareTModLoaderDataDirectories(gameDir: File) {
+        val externalDataRoot = File(Environment.getExternalStorageDirectory(), "RALauncher")
+        val candidateRoots = listOf(
+            File(externalDataRoot, "Terraria/tModLoader"),
+            File(gameDir, "Terraria/tModLoader")
+        )
+        candidateRoots.forEach { root ->
+            runCatching {
+                File(root, "Mods").mkdirs()
+                File(root, "ModPacks").mkdirs()
+            }
+        }
+    }
+
     private suspend fun extractGameFile(gameFile: File, outputDir: File, callback: InstallCallback): File? {
         val fileName = gameFile.name.lowercase()
         

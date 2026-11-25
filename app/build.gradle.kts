@@ -2,6 +2,7 @@ import org.gradle.kotlin.dsl.support.kotlinCompilerOptions
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.io.File
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.android.application)
@@ -24,6 +25,40 @@ val keystoreProps = Properties().apply {
 val localNdkPath = "/data/data/com.termux/files/usr/opt/android-ndk"
 val useLocalToolchain = File(localNdkPath).exists()
 
+val bunnyTerrariaProfile = providers.gradleProperty("bunnyTerrariaProfile")
+val bunnyTerrariaEnabled = bunnyTerrariaProfile.isPresent
+val bunnyTerrariaAssets = layout.buildDirectory.dir("generated/bunnyTerrariaAssets")
+
+val prepareBunnyTerrariaProfile by tasks.registering(Sync::class) {
+    from(bunnyTerrariaProfile.map { profilePath ->
+        val archive = file(profilePath)
+        require(archive.isFile) { "Bunny Terraria profile ZIP not found: $archive" }
+        ZipFile(archive).use { zip ->
+            val required = listOf("profile.json", "assets.json", "images.tsv", "texture-fallback.zip", "PixelShader.xnb", "ScreenShader.xnb", "TileShader.xnb", "TerrariaMusic.xgs", "Sound Bank.xsb")
+            required.forEach { name ->
+                require(zip.getEntry(name)?.isDirectory == false) {
+                    "Bunny Terraria profile is missing $name"
+                }
+            }
+        }
+        archive
+    }) {
+        into("mobile-terraria")
+        rename { "profile.zip" }
+    }
+    from("src/main/assets/mobile-terraria/control-sprites.json") {
+        into("mobile-terraria")
+        rename { "control-sprites.json" }
+    }
+    into(bunnyTerrariaAssets)
+}
+
+tasks.configureEach {
+    if (bunnyTerrariaEnabled && name in setOf("mergeDebugAssets", "mergeReleaseAssets")) {
+        dependsOn(prepareBunnyTerrariaProfile)
+    }
+}
+
 android {
     namespace = "com.app.ralaunch"
     compileSdk = 36
@@ -39,10 +74,25 @@ android {
         applicationId = "com.app.ralaunch"
         minSdk = 28
         targetSdk = 36
-        versionCode = 6
+        versionCode = 8
         versionName = "2.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                arguments += "-DBUNNY_MOBILE_TERRARIA_CONVERTER=${if (bunnyTerrariaEnabled) "ON" else "OFF"}"
+            }
+        }
+    }
+
+    sourceSets.named("main") {
+        if (bunnyTerrariaEnabled) {
+            java.srcDir("src/bunnyTerraria/java")
+            assets.srcDir(bunnyTerrariaAssets)
+        } else {
+            java.srcDir("src/noBunnyTerraria/java")
+        }
     }
 
     externalNativeBuild {
